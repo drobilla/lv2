@@ -34,6 +34,7 @@
 #include "lv2/worker/worker.h"
 
 #include <sndfile.h>
+#include <samplerate.h>
 
 #include <math.h>
 #include <stdbool.h>
@@ -80,6 +81,7 @@ typedef struct {
   bool       activated;
   bool       gain_changed;
   bool       sample_changed;
+  int        sample_rate;
 } Sampler;
 
 /**
@@ -96,6 +98,23 @@ typedef struct {
 } SampleMessage;
 
 /**
+   Convert an arbitrary non-mono audio buffer to mono.
+
+   This simply ignores the data on all channels but the first.
+*/
+static sf_count_t
+convert_to_mono(float *data, sf_count_t num_input_frames, uint32_t channels)
+{
+  sf_count_t num_output_frames = 0;
+
+  for (sf_count_t i = 0; i < num_input_frames * channels; i += channels) {
+    data[num_output_frames++] = data[i];
+  }
+
+  return num_output_frames;
+}
+
+/**
    Load a new sample and return it.
 
    Since this is of course not a real-time safe action, this is called in the
@@ -103,7 +122,7 @@ typedef struct {
    not modified.
 */
 static Sample*
-load_sample(LV2_Log_Logger* logger, const char* path)
+load_sample(LV2_Log_Logger* logger, const char* path, int sample_rate)
 {
   lv2_log_trace(logger, "Loading %s\n", path);
 
@@ -115,9 +134,7 @@ load_sample(LV2_Log_Logger* logger, const char* path)
   bool           error    = true;
   if (!sndfile || !info->frames) {
     lv2_log_error(logger, "Failed to open %s\n", path);
-  } else if (info->channels != 1) {
-    lv2_log_error(logger, "%s has %d channels\n", path, info->channels);
-  } else if (!(data = (float*)malloc(sizeof(float) * info->frames))) {
+  } else if (!(data = (float*)malloc(sizeof(float) * info->frames * info->channels))) {
     lv2_log_error(logger, "Failed to allocate memory for sample\n");
   } else {
     error = false;
@@ -131,8 +148,40 @@ load_sample(LV2_Log_Logger* logger, const char* path)
   }
 
   sf_seek(sndfile, 0ul, SEEK_SET);
-  sf_read_float(sndfile, data, info->frames);
+  sf_read_float(sndfile, data, info->frames * info->channels);
   sf_close(sndfile);
+
+  if (info->channels != 1) {
+    info->frames = convert_to_mono(data, info->frames, info->channels);
+    info->channels = 1;
+  }
+
+  if (info->samplerate != sample_rate) {
+    lv2_log_trace(logger, "Converting sample rate..\n");
+
+    const double src_ratio = (double)sample_rate/(double)info->samplerate;
+    const int output_size = ceil(info->frames * src_ratio);
+    float* const output_buffer = malloc(sizeof(float) * output_size);
+
+    SRC_DATA src_data;
+    src_data.data_in = data;
+    src_data.data_out = output_buffer;
+    src_data.input_frames = info->frames;
+    src_data.output_frames = output_size;
+    src_data.src_ratio = src_ratio;
+
+    if (src_simple(&src_data, SRC_SINC_BEST_QUALITY, 1) != 0) {
+      lv2_log_error(logger, "Sample rate conversion failed, eg-sampler will use unconverted sample\n");
+      free(output_buffer);
+    } else {
+      // set new amount of frames
+      info->frames = src_data.output_frames_gen;
+      // swap buffers
+      free(data);
+      data = output_buffer;
+      lv2_log_trace(logger, "Conversion finished\n");
+    }
+  }
 
   // Fill sample struct and return it
   sample->data     = data;
@@ -184,7 +233,7 @@ work(LV2_Handle                  instance,
     }
 
     // Load sample.
-    Sample* sample = load_sample(&self->logger, path);
+    Sample* sample = load_sample(&self->logger, path, self->sample_rate);
     if (sample) {
       // Send new sample to run() to be applied
       respond(handle, sizeof(Sample*), &sample);
@@ -282,6 +331,7 @@ instantiate(const LV2_Descriptor*     descriptor,
 
   self->gain    = 1.0f;
   self->gain_dB = 0.0f;
+  self->sample_rate = (int)rate;
 
   return (LV2_Handle)self;
 }
@@ -569,7 +619,7 @@ restore(LV2_Handle                  instance,
   if (!self->activated || !schedule) {
     // No scheduling available, load sample immediately
     lv2_log_trace(&self->logger, "Synchronous restore\n");
-    Sample* sample = load_sample(&self->logger, path);
+    Sample* sample = load_sample(&self->logger, path, self->sample_rate);
     if (sample) {
       free_sample(self, self->sample);
       self->sample         = sample;
